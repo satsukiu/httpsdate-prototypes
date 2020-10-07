@@ -5,8 +5,8 @@ use itertools::Itertools;
 use tokio::{self, time::{Duration, Instant}};
 use rand::random;
 
-const INITIAL_POLLS: usize = 10;
-const POLLS: usize = 10;
+const INITIAL_POLLS: usize = 20;
+const POLLS: usize = 50;
 
 const MIN_BETWEEN_POLLS: Duration = Duration::from_secs(5);
 
@@ -16,18 +16,18 @@ const NANOS_IN_SEC: u128 = 1_000_000_000;
 const MAX_DRIFT_PPM: u128 = 200;
 const ONE_MILLION: u128 = 1_000_000;
 
+const SAMPLE_CHUNK_SIZE: usize = 10;
+
 #[tokio::main]
 async fn main() {
     let https_sampler = HttpsSampler::new();
     // initial polls to get a good initial value
-    let (base_bounds, _, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
+    let (base_bounds, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
 
     let mut inter_bounds = vec![];
-    let mut deltas = vec![];
     for _ in 0..POLLS {
-        let (bounds, delta) = https_sampler.new_bounds().await;
+        let bounds = https_sampler.new_bounds().await;
         inter_bounds.push(bounds);
-        deltas.push(delta);
 
         let sleep_millis: f32 = random::<f32>() * 1000 as f32;
         let sleep_time = MIN_BETWEEN_POLLS + Duration::from_millis(sleep_millis as u64);
@@ -35,24 +35,41 @@ async fn main() {
     }
     // take another tight sample at the end. Don't reuse the existing bounds bc that
     // results in many error estimates of 0.
-    let (final_bounds, _, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
+    let (final_bounds, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
 
+    // estimate error and output in csv
+    println!("polls,size,delta_avg,delta_max,error");
     let estimator = ErrorEstimator::new(base_bounds.to_pair(), final_bounds.to_pair());
-    for combination_size in 1..inter_bounds.len() {
-        for combination in inter_bounds.clone().into_iter().combinations(combination_size) {
-            let bound = combination.into_iter().fold1(|b1, b2| b1.combine(b2)).unwrap();
-            let err = estimator.estimate_error(bound.to_pair());
-            // todo add delta average or something?
-            println!("polls: {:?}, size: {:?}, error: {:?}", combination_size, bound.size(), err);
+    // produce combinations. If we try to produce combinations accross the whole data set we'll
+    // end up with millions of combinations, so chunk the values up first instead. (We still want
+    // to poll a bunch to get a variety of samples).
+
+    for sample_chunk_iter in &inter_bounds.into_iter().chunks(SAMPLE_CHUNK_SIZE) {
+        let sample_chunk = sample_chunk_iter.collect::<Vec<Bounds>>();
+        for combination_size in 1..sample_chunk.len() {
+            for combination in sample_chunk.iter().combinations(combination_size) {
+                let bound = combination.into_iter().fold(Option::<Bounds>::None, |maybe_b1, b2| {
+                    match maybe_b1 {
+                        Some(b1) => Some(b1.combine(b2)),
+                        None => Some(b2.clone()),
+                    }
+                }).unwrap();
+                let err = estimator.estimate_error(bound.to_pair());
+                println!("{:?},{:?},{:?},{:?},{:?}",
+                    combination_size, bound.size(), bound.avg_delta(), bound.max_delta(), err);
+            }
         }
+        
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Bounds {
     mono: Instant,
     utc_min: Timestamp,
     utc_max: Timestamp,
+    /// deltas of polls used to calculate this bound.
+    deltas: Vec<u64>,
 }
 
 impl Bounds {
@@ -63,21 +80,25 @@ impl Bounds {
             mono: later_mono,
             utc_min: self.utc_min + time_diff - max_err,
             utc_max: self.utc_max + time_diff + max_err,
+            deltas: self.deltas.clone()
         }
     }
 
-    fn combine(&self, other: Bounds) -> Bounds {
+    fn combine(&self, other: &Bounds) -> Bounds {
         let (earlier, later) = if self.mono < other.mono {
-            (self, &other)
+            (self, other)
         } else {
-            (&other, self)
+            (other, self)
         };
 
         let projected = earlier.project(later.mono);
+        let mut new_deltas = self.deltas.clone();
+        new_deltas.extend_from_slice(other.deltas.as_slice());
         let new = Bounds {
             mono: later.mono,
             utc_min: std::cmp::max(projected.utc_min, later.utc_min),
-            utc_max: std::cmp::min(projected.utc_max, later.utc_max)
+            utc_max: std::cmp::min(projected.utc_max, later.utc_max),
+            deltas: new_deltas
         };
         assert!(new.utc_min <= new.utc_max);
         new
@@ -90,12 +111,19 @@ impl Bounds {
     fn size(&self) -> u128 {
         self.utc_max - self.utc_min
     }
+
+    fn avg_delta(&self) -> u64 {
+        self.deltas.iter().fold(0, |a,x| a + x) / self.deltas.len() as u64
+    }
+
+    fn max_delta(&self) -> u64 {
+        self.deltas.iter().fold(0, |a,x| std::cmp::max(a,*x))
+    }
 }
 
 struct HttpsSampler {
     client: Client<HttpsConnector<HttpConnector>, Body>,
     uri: Uri,
-    base: tokio::time::Instant,
 }
 
 impl HttpsSampler {
@@ -103,11 +131,11 @@ impl HttpsSampler {
         let https = HttpsConnector::new();
         let client = Client::builder().build(https);
         let uri = "https://clients1.google.com/generate_204".parse().unwrap();
-        Self { client, uri, base: tokio::time::Instant::now() }
+        Self { client, uri }
     }
 
     /// Poll for a new bounds. Returns bounds and delta (rtt/2)
-    async fn new_bounds(&self) -> (Bounds, u64) {
+    async fn new_bounds(&self) -> Bounds {
         let before = tokio::time::Instant::now();
         let resp = self.client.get(self.uri.clone()).await.unwrap();
         let rtt = before.elapsed();
@@ -118,36 +146,34 @@ impl HttpsSampler {
         let utc_parsed = DateTime::parse_from_rfc2822(utc_date).unwrap();
         let utc_ts = utc_parsed.timestamp() as u128 * NANOS_IN_SEC;
         let delta = (rtt.as_nanos()) / 2;
-        let bounds = Bounds {
+        Bounds {
             mono: before + Duration::from_nanos(delta as u64),
             utc_min: utc_ts - delta,
-            utc_max: utc_ts + NANOS_IN_SEC + delta
-        };
-        (bounds, delta as u64)
+            utc_max: utc_ts + NANOS_IN_SEC + delta,
+            deltas: vec![delta as u64]
+        }
     }
 
     /// Get a tight bound by polling multiple times.
-    /// Returns (final bound, list of multiple bounds created, list of deltas)
-    async fn tight_bound(&self, num_polls: usize) -> (Bounds, Vec<Bounds>, Vec<u64>) {
-        let mut deltas = vec![];
+    /// Returns (final bound, list of multiple bounds created)
+    async fn tight_bound(&self, num_polls: usize) -> (Bounds, Vec<Bounds>) {
         let mut inter_bounds = vec![];
-        let (bound, delta) = self.new_bounds().await;
-        let mut acc_bound = bound;
-        deltas.push(delta);
+        let bound = self.new_bounds().await;
+        let mut acc_bound = bound.clone();
         inter_bounds.push(bound);
 
         for _ in 1..num_polls {
-            tokio::time::delay_until(Self::ideal_time(&acc_bound, &deltas)).await;
-            let (bound, delta) = self.new_bounds().await;
-            deltas.push(delta);
-            inter_bounds.push(bound);
-            acc_bound = acc_bound.combine(bound);
+            tokio::time::delay_until(Self::ideal_time(&acc_bound)).await;
+            let bound = self.new_bounds().await;
+            inter_bounds.push(bound.clone());
+            let i = acc_bound.combine(&bound);
+            acc_bound = i;
         }
-        (acc_bound, inter_bounds, deltas)
+        (acc_bound, inter_bounds)
     }
 
-    fn ideal_time(bounds: &Bounds, deltas: &Vec<u64>) -> Instant {
-        let delta_est = deltas.iter().fold(0, |a,x| a + x) / deltas.len() as u64;
+    fn ideal_time(bounds: &Bounds) -> Instant {
+        let delta_est = bounds.avg_delta();
 
         let subs_off = subs((bounds.utc_min + bounds.utc_max) / 2);
         let ideal = bounds.mono + Duration::from_nanos(NANOS_IN_SEC as u64)
@@ -180,7 +206,6 @@ struct ErrorEstimator {
 
 impl ErrorEstimator {
     fn new(first: Pair, last: Pair) -> Self {
-        let last_mono_nanos = last.mono.duration_since(first.mono).as_nanos();
         Self {
             base_instant: first.mono,
             slope_num: last.utc - first.utc,
