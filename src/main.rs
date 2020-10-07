@@ -1,133 +1,101 @@
-use async_trait::async_trait;
-use libc;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime};
 use hyper::{Body, Client, Uri, client::HttpConnector};
 use hyper_rustls::HttpsConnector;
+use itertools::Itertools;
 use tokio::{self, time::{Duration, Instant}};
-use futures::stream::StreamExt;
+use rand::random;
 
-#[allow(dead_code)]
+const INITIAL_POLLS: usize = 10;
+const POLLS: usize = 10;
+
+const MIN_BETWEEN_POLLS: Duration = Duration::from_secs(5);
+
+type Timestamp = u128;
+const NANOS_IN_SEC: u128 = 1_000_000_000;
+
+const MAX_DRIFT_PPM: u128 = 200;
+const ONE_MILLION: u128 = 1_000_000;
 
 #[tokio::main]
 async fn main() {
-    // let bench_sampler = BenchSampler;
-    // let low_res_sampler = LowResSampler;
-    // let multi_sampler = MultiSampler::new(LowResSampler);
     let https_sampler = HttpsSampler::new();
-    let multi_https_sampler = MultiSampler::new(HttpsSampler::new());
+    // initial polls to get a good initial value
+    let (base_bounds, _, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
 
-    // println!("Accuracy check, bench: {:?}", run_accuracy(bench_sampler).await);
-    // println!("Accuracy check, low: {:?}", run_accuracy(low_res_sampler).await);
-    // println!("Accuracy check, low multi: {:?}", run_accuracy(multi_sampler).await);
+    let mut inter_bounds = vec![];
+    let mut deltas = vec![];
+    for _ in 0..POLLS {
+        let (bounds, delta) = https_sampler.new_bounds().await;
+        inter_bounds.push(bounds);
+        deltas.push(delta);
 
-    println!("Accuracy check, http multiple: {:?}", accuracy_check(&multi_https_sampler).await);
-}
-
-const CHECK_TIMES: u32 = 10;
-
-async fn run_accuracy<T: TimeSampler + Send + Sync>(sampler: T) -> Vec<f64> {
-    futures::stream::iter(0..CHECK_TIMES)
-        .then(|_| async {
-            tokio::time::delay_for(Duration::from_secs(60)).await;
-            accuracy_check(&sampler).await
-        })
-        .collect()
-        .await
-}
-
-async fn accuracy_check<T: TimeSampler + Send + Sync>(sampler: &T) -> f64 {
-    let bench_collector_fut = async {
-        let sampler = BenchSampler;
-        futures::stream::iter(0u8..5).then(|_| async {
-            let s = sampler.sample().await;
-            tokio::time::delay_for(Duration::from_millis(500)).await;
-            s
-        }).collect::<Vec<Sample>>().await
-    };
-
-    let sampler_fut = async move {
-        tokio::time::delay_for(Duration::from_millis(500)).await;
-        sampler.sample().await
-    };
-
-    let (bench_times, sample) = futures::future::join(bench_collector_fut, sampler_fut).await;
-    // guess what our benchmark would've given as utc at the mono time of our sample.
-    let bench_mono = bench_times.iter().map(|sample| sample.mono.0 as f64).collect::<Vec<_>>();
-    let bench_utc = bench_times.iter().map(|sample| sample.utc.0 as f64).collect::<Vec<_>>();
-    let (slope, intercept): (f64, f64) = linreg::linear_regression(bench_mono.as_slice(), bench_utc.as_slice()).unwrap();
-
-    let assumed_utc_time = sample.mono.0 as f64 * slope + intercept;
-    let diff_nanos = assumed_utc_time - sample.utc.0 as f64;
-    (diff_nanos) / NANOS_IN_SEC as f64
-}
-
-#[derive(Debug, Clone)]
-struct Timestamp(u128);
-const NANOS_IN_SEC: u128 = 1_000_000_000;
-
-impl Timestamp {
-    fn monotonic() -> Self {
-        unsafe {
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            libc::clock_gettime(
-                libc::CLOCK_MONOTONIC,
-                &mut ts
-            );
-            let nanos = ts.tv_sec as u128 * NANOS_IN_SEC + ts.tv_nsec as u128;
-            Timestamp(nanos)
-        }
+        let sleep_millis: f32 = random::<f32>() * 1000 as f32;
+        let sleep_time = MIN_BETWEEN_POLLS + Duration::from_millis(sleep_millis as u64);
+        tokio::time::delay_for(sleep_time).await;
     }
+    // take another tight sample at the end. Don't reuse the existing bounds bc that
+    // results in many error estimates of 0.
+    let (final_bounds, _, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
 
-    fn avg(&self, other: &Self) -> Self {
-        Timestamp((self.0 + other.0) >> 1)
-    }
-}
-
-#[derive(Debug)]
-struct Sample {
-    utc: Timestamp,
-    mono: Timestamp,
-}
-
-#[async_trait]
-trait TimeSampler {
-    async fn sample(&self) -> Sample;
-}
-
-/// Samples unix system time. Assuming this is well synched via NTP.
-struct BenchSampler;
-
-#[async_trait]
-impl TimeSampler for BenchSampler {
-    async fn sample(&self) -> Sample {
-        let before = Timestamp::monotonic();
-        let utc = Timestamp(Utc::now().timestamp_nanos() as u128);
-        let after = Timestamp::monotonic();
-        Sample {
-            utc,
-            mono: before.avg(&after),
+    let estimator = ErrorEstimator::new(base_bounds.to_pair(), final_bounds.to_pair());
+    for combination_size in 1..inter_bounds.len() {
+        for combination in inter_bounds.clone().into_iter().combinations(combination_size) {
+            let bound = combination.into_iter().fold1(|b1, b2| b1.combine(b2)).unwrap();
+            let err = estimator.estimate_error(bound.to_pair());
+            // todo add delta average or something?
+            println!("polls: {:?}, size: {:?}, error: {:?}", combination_size, bound.size(), err);
         }
     }
 }
 
-struct LowResSampler;
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    mono: Instant,
+    utc_min: Timestamp,
+    utc_max: Timestamp,
+}
 
-#[async_trait]
-impl TimeSampler for LowResSampler {
-    async fn sample(&self) -> Sample {
-        let before = Timestamp::monotonic();
-        let utc = Timestamp(Utc::now().timestamp() as u128 * NANOS_IN_SEC);
-        let after = Timestamp::monotonic();
-        Sample {
-            utc,
-            mono: before.avg(&after),
+impl Bounds {
+    fn project(&self, later_mono: Instant) -> Bounds {
+        let time_diff = later_mono.duration_since(self.mono).as_nanos();
+        let max_err = time_diff * MAX_DRIFT_PPM / ONE_MILLION;
+        Bounds {
+            mono: later_mono,
+            utc_min: self.utc_min + time_diff - max_err,
+            utc_max: self.utc_max + time_diff + max_err,
         }
+    }
+
+    fn combine(&self, other: Bounds) -> Bounds {
+        let (earlier, later) = if self.mono < other.mono {
+            (self, &other)
+        } else {
+            (&other, self)
+        };
+
+        let projected = earlier.project(later.mono);
+        let new = Bounds {
+            mono: later.mono,
+            utc_min: std::cmp::max(projected.utc_min, later.utc_min),
+            utc_max: std::cmp::min(projected.utc_max, later.utc_max)
+        };
+        assert!(new.utc_min <= new.utc_max);
+        new
+    }
+
+    fn to_pair(&self) -> Pair {
+        Pair { mono: self.mono, utc: (self.utc_min + self.utc_max) / 2}
+    }
+
+    fn size(&self) -> u128 {
+        self.utc_max - self.utc_min
     }
 }
 
 struct HttpsSampler {
     client: Client<HttpsConnector<HttpConnector>, Body>,
-    uri: Uri
+    uri: Uri,
+    base: tokio::time::Instant,
 }
 
 impl HttpsSampler {
@@ -135,80 +103,98 @@ impl HttpsSampler {
         let https = HttpsConnector::new();
         let client = Client::builder().build(https);
         let uri = "https://clients1.google.com/generate_204".parse().unwrap();
-        Self { client, uri }
+        Self { client, uri, base: tokio::time::Instant::now() }
     }
-}
 
-#[async_trait]
-impl TimeSampler for HttpsSampler {
-    async fn sample(&self) -> Sample {
-        let before = Timestamp::monotonic();
-
+    /// Poll for a new bounds. Returns bounds and delta (rtt/2)
+    async fn new_bounds(&self) -> (Bounds, u64) {
+        let before = tokio::time::Instant::now();
         let resp = self.client.get(self.uri.clone()).await.unwrap();
+        let rtt = before.elapsed();
+
         let utc_date = resp.headers()
             .get(&hyper::header::DATE).unwrap()
             .to_str().unwrap();
         let utc_parsed = DateTime::parse_from_rfc2822(utc_date).unwrap();
-        let utc_ts = Timestamp(utc_parsed.timestamp() as u128 * NANOS_IN_SEC);
+        let utc_ts = utc_parsed.timestamp() as u128 * NANOS_IN_SEC;
+        let delta = (rtt.as_nanos()) / 2;
+        let bounds = Bounds {
+            mono: before + Duration::from_nanos(delta as u64),
+            utc_min: utc_ts - delta,
+            utc_max: utc_ts + NANOS_IN_SEC + delta
+        };
+        (bounds, delta as u64)
+    }
 
-        let after = Timestamp::monotonic();
-        println!("mono time diff nanos: {:?}", after.0 - before.0);
-        Sample {
-            utc: utc_ts,
-            mono: before.avg(&after),
+    /// Get a tight bound by polling multiple times.
+    /// Returns (final bound, list of multiple bounds created, list of deltas)
+    async fn tight_bound(&self, num_polls: usize) -> (Bounds, Vec<Bounds>, Vec<u64>) {
+        let mut deltas = vec![];
+        let mut inter_bounds = vec![];
+        let (bound, delta) = self.new_bounds().await;
+        let mut acc_bound = bound;
+        deltas.push(delta);
+        inter_bounds.push(bound);
+
+        for _ in 1..num_polls {
+            tokio::time::delay_until(Self::ideal_time(&acc_bound, &deltas)).await;
+            let (bound, delta) = self.new_bounds().await;
+            deltas.push(delta);
+            inter_bounds.push(bound);
+            acc_bound = acc_bound.combine(bound);
         }
+        (acc_bound, inter_bounds, deltas)
     }
-}
 
-/// A sampler that uses a low resolution sampler (in sec) and samples
-/// it multiple times to obtain a higher quality sample.
-struct MultiSampler<S: TimeSampler> {
-    low_res_sampler: S,
-}
+    fn ideal_time(bounds: &Bounds, deltas: &Vec<u64>) -> Instant {
+        let delta_est = deltas.iter().fold(0, |a,x| a + x) / deltas.len() as u64;
 
-impl <S:TimeSampler> MultiSampler<S> {
-    fn new(s: S) -> Self {
-        MultiSampler {low_res_sampler: s}
-    }
-}
-
-#[async_trait]
-impl <S:TimeSampler + Sync + Send> TimeSampler for MultiSampler<S> {
-    async fn sample(&self) -> Sample {
-        // this samples a source that can only provide second resolution a few times
-        // within a second.
-        // it then looks for a sample pair during which the second changed, and
-        // takes the midpoint of those samples to create a new sample.
-
+        let subs_off = subs((bounds.utc_min + bounds.utc_max) / 2);
+        let ideal = bounds.mono + Duration::from_nanos(NANOS_IN_SEC as u64)
+            + MIN_BETWEEN_POLLS
+            - Duration::from_nanos(subs_off as u64) - Duration::from_nanos(delta_est);
         let now = Instant::now();
-        let timing_delays = (0..5)
-            .map(|i| now.checked_add(Duration::from_millis(250 * i)).unwrap())
-            .collect::<Vec<_>>();
-        let samples = futures::stream::iter(timing_delays)
-            .then(|instant| async move {
-                tokio::time::delay_until(instant).await;
-                self.low_res_sampler.sample().await
-            })
-            .collect::<Vec<_>>()
-            .await;
-        
-        let mut second_change_idx = 10000;
-        for idx in 0..5 {
-            let s1 = samples.get(idx).unwrap();
-            let s2 = samples.get(idx + 1).unwrap();
-            if s1.utc.0 == s2.utc.0 - NANOS_IN_SEC {
-                second_change_idx = idx;
-                break;
-            }
+        match now.checked_duration_since(ideal) {
+            None => ideal,
+            Some(d) => ideal + Duration::from_secs(d.as_secs() + 1)
         }
+    }
+}
 
-        let final_sample_1 = samples.get(second_change_idx).unwrap();
-        let final_sample_2 = samples.get(second_change_idx + 1).unwrap();
-        Sample {
-            utc: final_sample_2.utc.clone(), // this is the later second.
-            mono: final_sample_1.mono.avg(&final_sample_2.mono)
-        } // note - we can put hard bounds on the monotonic times at which the second
-        // changed, should be between the before sample for sample 1 and the after sample
-        // for sample 2.
+fn subs(timestamp: Timestamp) -> Timestamp {
+    timestamp % NANOS_IN_SEC
+}
+
+struct Pair {
+    mono: Instant,
+    utc: Timestamp,
+}
+
+struct ErrorEstimator {
+    /// Instant considered monotonic time zero
+    base_instant: Instant,
+    slope_num: u128,
+    slope_den: u128,
+    intercept: u128,
+}
+
+impl ErrorEstimator {
+    fn new(first: Pair, last: Pair) -> Self {
+        let last_mono_nanos = last.mono.duration_since(first.mono).as_nanos();
+        Self {
+            base_instant: first.mono,
+            slope_num: last.utc - first.utc,
+            slope_den: last.mono.duration_since(first.mono).as_nanos(),
+            intercept: first.utc
+        }
+    }
+
+    fn estimate_utc(&self, mono: Instant) -> Timestamp {
+        let mono_nanos = mono.duration_since(self.base_instant).as_nanos();
+        self.intercept + (mono_nanos * self.slope_num) / self.slope_den
+    }
+
+    fn estimate_error(&self, pair: Pair) -> i128 {
+        pair.utc as i128 - self.estimate_utc(pair.mono) as i128
     }
 }
