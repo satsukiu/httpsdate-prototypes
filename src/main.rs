@@ -1,12 +1,14 @@
+use argh::FromArgs;
 use chrono::{DateTime};
 use hyper::{Body, Client, Uri, client::HttpConnector};
 use hyper_rustls::HttpsConnector;
 use itertools::Itertools;
 use tokio::{self, time::{Duration, Instant}};
 use rand::random;
+use std::io::Write;
 
-const INITIAL_POLLS: usize = 20;
-const POLLS: usize = 50;
+const BASE_POLLS_DEFAULT: usize = 20;
+const POLLS_DEFAULT: usize = 50;
 
 const MIN_BETWEEN_POLLS: Duration = Duration::from_secs(5);
 
@@ -18,35 +20,58 @@ const ONE_MILLION: u128 = 1_000_000;
 
 const SAMPLE_CHUNK_SIZE: usize = 10;
 
+#[derive(FromArgs)]
+/// A program that samples an HTTP server repeatedly, and produces data on the
+/// estimated error of the samples. The data is intended to be ingested by a
+/// separate tool.
+struct Args {
+    /// file to output results to. Prints to stdout if not provided
+    #[argh(option)]
+    outfile: Option<String>,
+    
+    /// number of polls used to obtain the base sample other samples are compared against
+    #[argh(option, default="BASE_POLLS_DEFAULT")]
+    base_polls: usize,
+
+    /// number of polls taken to produce data
+    #[argh(option, default="POLLS_DEFAULT")]
+    polls: usize,
+}
+
 #[tokio::main]
 async fn main() {
+    let Args {outfile, base_polls, polls } = argh::from_env::<Args>();
+
     let https_sampler = HttpsSampler::new();
     // initial polls to get a good initial value
-    let (base_bounds, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
+    let (base_bounds, _) = https_sampler.tight_bound(base_polls).await;
+    println!("Initial bound size: {:?}", base_bounds.size());
 
+    // Poll samples without combining
     let mut inter_bounds = vec![];
-    for _ in 0..POLLS {
+    for _ in 0..polls {
         let bounds = https_sampler.new_bounds().await;
         inter_bounds.push(bounds);
-
+        // Poll at random intervals to try and get a variety of results
         let sleep_millis: f32 = random::<f32>() * 1000 as f32;
         let sleep_time = MIN_BETWEEN_POLLS + Duration::from_millis(sleep_millis as u64);
         tokio::time::delay_for(sleep_time).await;
     }
-    // take another tight sample at the end. Don't reuse the existing bounds bc that
-    // results in many error estimates of 0.
-    let (final_bounds, _) = https_sampler.tight_bound(INITIAL_POLLS).await;
+    // take another tight sample at the end.
+    let (final_bounds, _) = https_sampler.tight_bound(base_polls).await;
+    println!("Final bound size: {:?}", final_bounds.size());
 
-    // estimate error and output in csv
-    println!("polls,size,delta_avg,delta_max,error");
+    // assume initial and final bounds are pretty good and estimate errors using them
+    let mut out = vec![];
+    writeln!(&mut out, "polls,size,delta_avg,delta_max,error").unwrap();
     let estimator = ErrorEstimator::new(base_bounds.to_pair(), final_bounds.to_pair());
-    // produce combinations. If we try to produce combinations accross the whole data set we'll
-    // end up with millions of combinations, so chunk the values up first instead. (We still want
-    // to poll a bunch to get a variety of samples).
-
+    
+    // produce combinations of the bounds previously sampled and evaluate their errors. If we try
+    // to produce combinations accross the whole data set we'll end up with millions of
+    // combinations, so chunk the values up first instead.
     for sample_chunk_iter in &inter_bounds.into_iter().chunks(SAMPLE_CHUNK_SIZE) {
         let sample_chunk = sample_chunk_iter.collect::<Vec<Bounds>>();
-        for combination_size in 1..sample_chunk.len() {
+        for combination_size in 1..sample_chunk.len()+1 {
             for combination in sample_chunk.iter().combinations(combination_size) {
                 let bound = combination.into_iter().fold(Option::<Bounds>::None, |maybe_b1, b2| {
                     match maybe_b1 {
@@ -55,11 +80,19 @@ async fn main() {
                     }
                 }).unwrap();
                 let err = estimator.estimate_error(bound.to_pair());
-                println!("{:?},{:?},{:?},{:?},{:?}",
-                    combination_size, bound.size(), bound.avg_delta(), bound.max_delta(), err);
+                writeln!(&mut out, "{:?},{:?},{:?},{:?},{:?}",
+                    combination_size, bound.size(), bound.avg_delta(), bound.max_delta(), err).unwrap();
             }
         }
-        
+    }
+
+    match outfile {
+        None => std::io::stdout().write_all(&out).unwrap(),
+        Some(filename) => {
+            let path = std::path::Path::new(&filename);
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&out).unwrap();
+        }
     }
 }
 
@@ -134,7 +167,7 @@ impl HttpsSampler {
         Self { client, uri }
     }
 
-    /// Poll for a new bounds. Returns bounds and delta (rtt/2)
+    /// Poll for a new bounds.
     async fn new_bounds(&self) -> Bounds {
         let before = tokio::time::Instant::now();
         let resp = self.client.get(self.uri.clone()).await.unwrap();
@@ -196,6 +229,7 @@ struct Pair {
     utc: Timestamp,
 }
 
+// Estimates sample errors based on two pairs assumed to be very accurate
 struct ErrorEstimator {
     /// Instant considered monotonic time zero
     base_instant: Instant,
