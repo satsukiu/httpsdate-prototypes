@@ -11,6 +11,7 @@ use tokio::{self, time::{Duration, Instant}};
 use rand::random;
 use std::io::Write;
 
+const DEFAULT_FILENAME: &str = "out.csv";
 const BASE_POLLS_DEFAULT: usize = 20;
 const POLLS_DEFAULT: usize = 50;
 
@@ -29,9 +30,9 @@ const SAMPLE_CHUNK_SIZE: usize = 10;
 /// estimated error of the samples. The data is intended to be ingested by a
 /// separate tool.
 struct Args {
-    /// file to output results to. Prints to stdout if not provided
-    #[argh(option)]
-    outfile: Option<String>,
+    /// file to output results to
+    #[argh(option, default="DEFAULT_FILENAME.to_string()")]
+    outfile: String,
     
     /// number of polls used to obtain the base sample other samples are compared against
     #[argh(option, default="BASE_POLLS_DEFAULT")]
@@ -90,14 +91,9 @@ async fn main() {
         }
     }
 
-    match outfile {
-        None => std::io::stdout().write_all(&out).unwrap(),
-        Some(filename) => {
-            let path = std::path::Path::new(&filename);
-            let mut file = std::fs::File::create(&path).unwrap();
-            file.write_all(&out).unwrap();
-        }
-    }
+    let path = std::path::Path::new(&outfile);
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&out).unwrap();
 }
 
 #[derive(Clone, Debug)]
