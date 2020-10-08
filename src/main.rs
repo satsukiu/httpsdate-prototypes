@@ -1,3 +1,7 @@
+//! Script that polls an HTTP server repeatedly to obtain time, combines polls
+//! to improve time estimates, and attempts to calculate the error of each estimate.
+//! The easiest way to build and run this is via cargo `cargo run -- [args]`
+
 use argh::FromArgs;
 use chrono::{DateTime};
 use hyper::{Body, Client, Uri, client::HttpConnector};
@@ -21,7 +25,7 @@ const ONE_MILLION: u128 = 1_000_000;
 const SAMPLE_CHUNK_SIZE: usize = 10;
 
 #[derive(FromArgs)]
-/// A program that samples an HTTP server repeatedly, and produces data on the
+/// A program that polls an HTTP server repeatedly, and produces data on the
 /// estimated error of the samples. The data is intended to be ingested by a
 /// separate tool.
 struct Args {

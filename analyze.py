@@ -1,5 +1,9 @@
 #!/usr/bin/python3
 
+# A script that ingests data produced from the 'httpdate' CLI. This currently
+# does little but will eventually derive some relationship between sample error
+# distribution and the other recorded data.
+
 import sys
 import collections
 import math
